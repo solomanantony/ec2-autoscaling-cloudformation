@@ -1,0 +1,286 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Soloman Auto Scaling with Load Balancer and CloudWatch
+
+Resources:
+
+# ---------------- VPC ----------------
+
+  SolomanVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+      Tags:
+        - Key: Name
+          Value: soloman-vpc
+
+# ---------------- Internet Gateway ----------------
+
+  SolomanInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  SolomanGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref SolomanVPC
+      InternetGatewayId: !Ref SolomanInternetGateway
+
+# ---------------- Public Subnet 1 ----------------
+
+  SolomanSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SolomanVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: ap-south-2a
+      MapPublicIpOnLaunch: true
+
+      Tags:
+        - Key: Name
+          Value: soloman-subnet-1
+
+# ---------------- Public Subnet 2 ----------------
+
+  SolomanSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SolomanVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: ap-south-2b
+      MapPublicIpOnLaunch: true
+
+      Tags:
+        - Key: Name
+          Value: soloman-subnet-2
+
+# ---------------- Route Table ----------------
+
+  SolomanRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SolomanVPC
+
+  SolomanRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SolomanGatewayAttachment
+    Properties:
+      RouteTableId: !Ref SolomanRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref SolomanInternetGateway
+
+# ---------------- Route Table Associations ----------------
+
+  SolomanSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref SolomanRouteTable
+      SubnetId: !Ref SolomanSubnet1
+
+  SolomanSubnet2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref SolomanRouteTable
+      SubnetId: !Ref SolomanSubnet2
+
+# ---------------- Security Group ----------------
+
+  SolomanSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH
+      VpcId: !Ref SolomanVPC
+
+      SecurityGroupIngress:
+
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+      Tags:
+        - Key: Name
+          Value: soloman-sg
+
+# ---------------- Launch Template ----------------
+
+  SolomanLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: soloman-launch-template
+
+      LaunchTemplateData:
+
+        ImageId: ami-0eab39170eb2844c5
+        InstanceType: t3.micro
+        KeyName: solo
+
+        SecurityGroupIds:
+          - !Ref SolomanSecurityGroup
+
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            yum install httpd -y
+            systemctl start httpd
+            systemctl enable httpd
+
+            INSTANCE_ID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
+
+            echo "<h1>Soloman Auto Scaling Instance</h1>" > /var/www/html/index.html
+            echo "<h2>$INSTANCE_ID</h2>" >> /var/www/html/index.html
+
+# ---------------- Target Group ----------------
+
+  SolomanTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref SolomanVPC
+      TargetType: instance
+
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+
+# ---------------- Application Load Balancer ----------------
+
+  SolomanLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: soloman-alb
+      Scheme: internet-facing
+      Type: application
+
+      Subnets:
+        - !Ref SolomanSubnet1
+        - !Ref SolomanSubnet2
+
+      SecurityGroups:
+        - !Ref SolomanSecurityGroup
+
+# ---------------- Listener ----------------
+
+  SolomanListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref SolomanLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref SolomanTargetGroup
+
+# ---------------- Auto Scaling Group ----------------
+
+  SolomanAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+
+      MinSize: '1'
+      MaxSize: '3'
+      DesiredCapacity: '1'
+
+      VPCZoneIdentifier:
+        - !Ref SolomanSubnet1
+        - !Ref SolomanSubnet2
+
+      LaunchTemplate:
+        LaunchTemplateId: !Ref SolomanLaunchTemplate
+        Version: !GetAtt SolomanLaunchTemplate.LatestVersionNumber
+
+      TargetGroupARNs:
+        - !Ref SolomanTargetGroup
+
+      Tags:
+        - Key: Name
+          Value: soloman-instance
+          PropagateAtLaunch: true
+
+# ---------------- Scale Up Policy ----------------
+
+  SolomanScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref SolomanAutoScalingGroup
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: '60'
+
+# ---------------- Scale Down Policy ----------------
+
+  SolomanScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref SolomanAutoScalingGroup
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      Cooldown: '60'
+
+# ---------------- High CPU Alarm ----------------
+
+  SolomanCPUHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+
+      AlarmDescription: Scale up on high CPU
+
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 70
+
+      ComparisonOperator: GreaterThanThreshold
+
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref SolomanAutoScalingGroup
+
+      AlarmActions:
+        - !Ref SolomanScaleUpPolicy
+
+# ---------------- Low CPU Alarm ----------------
+
+  SolomanCPULowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+
+      AlarmDescription: Scale down on low CPU
+
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 30
+
+      ComparisonOperator: LessThanThreshold
+
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref SolomanAutoScalingGroup
+
+      AlarmActions:
+        - !Ref SolomanScaleDownPolicy
+
+# ---------------- Outputs ----------------
+
+Outputs:
+
+  LoadBalancerDNS:
+    Description: Load Balancer DNS
+    Value: !GetAtt SolomanLoadBalancer.DNSName
