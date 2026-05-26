@@ -1,4 +1,3 @@
-````md
 # AWS CloudFormation Auto Scaling Project
 
 ## 📌 Project Overview
